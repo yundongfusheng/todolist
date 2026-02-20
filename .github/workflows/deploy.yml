@@ -1,0 +1,105 @@
+name: CI/CD -> EC2
+
+on:
+  # Variable 1: change trigger branch here (default main)
+  push:
+    branches: [main]
+  # Optional manual trigger
+  workflow_dispatch:
+
+env:
+  # Variable 2: Docker image / container name
+  IMAGE_NAME: todolist
+  # Variable 3: build command
+  BUILD_CMD: npm run build
+  # Variable 4: test command (set empty string to skip)
+  TEST_CMD: npm run e2e
+  # Variable 5: host:container port mapping
+  PORT_MAP: 80:80
+
+jobs:
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: ${{ env.BUILD_CMD }}
+
+      - name: Run tests (optional)
+        run: |
+          if [ -n "${{ env.TEST_CMD }}" ]; then
+            ${{ env.TEST_CMD }}
+          else
+            echo "TEST_CMD is empty, skip tests."
+          fi
+
+      - name: Upload Cypress screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-screenshots
+          path: cypress/screenshots
+          if-no-files-found: ignore
+
+  deploy:
+    name: Docker Build & Deploy
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t $IMAGE_NAME:${{ github.sha }} \
+            -t $IMAGE_NAME:latest \
+            .
+
+      - name: Save image to tarball
+        run: docker save $IMAGE_NAME:${{ github.sha }} | gzip > image.tar.gz
+
+      - name: SCP image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: image.tar.gz
+          target: ~/deploy/
+
+      - name: SSH deploy container on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/deploy
+
+            docker load < image.tar.gz
+            docker stop ${{ env.IMAGE_NAME }} 2>/dev/null || true
+            docker rm ${{ env.IMAGE_NAME }} 2>/dev/null || true
+
+            docker run -d \
+              --name ${{ env.IMAGE_NAME }} \
+              --restart unless-stopped \
+              -p ${{ env.PORT_MAP }} \
+              ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            docker image prune -f
+            sleep 5
+            curl -sf http://localhost/ >/dev/null
